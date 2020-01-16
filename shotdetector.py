@@ -3,10 +3,15 @@ import cv2
 class FrameCallback(object):
     def __init__(self):
         self.callbacks = []
-        self.id = 0
+        #self.id = 0
+        self.features = []
     def AddCallback(self, callback):
         self.callbacks.append(callback)
-
+    def GetFeatures(self, i):
+        feat = list(self.features[i]) if len(self.features) > i else []
+        for c in self.callbacks:
+            feat += c.GetFeatures(i)
+        return feat
 import ui
 class VideoParser(FrameCallback):
     def sanitize_device(self, device):
@@ -24,10 +29,11 @@ class VideoParser(FrameCallback):
         progress.start()
 
         count = 0
-        suc = True
-        while suc:
+        while True:
             timestamp = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
             suc, frame = self.cap.read()
+            if not suc:
+                break
             for c in self.callbacks:
                 c.OnFrame(count, timestamp, frame)
                 count += 1
@@ -104,18 +110,36 @@ class ShotDetector(FrameCallback):
             bright -= 1
         bright += 1
         return s/float(pixels), bright
-        
+    
+    def adjust_shot(self):
+        shot = self.shotList[-1]
+        shot.stopTime = self.frame.time
+        shot.frame = self.bestFrame
+
+        first_id = shot.id
+        last_id = self.frame.shotId #self.shotList[i+1].shotId
+        while first_id < last_id and self.frameFeat[last_id - 1].diff < self.frameFeat[last_id].diff:
+            last_id -= 1
+        stable = sum(f.diff for f in self.frameFeat[first_id:last_id])
+        if first_id >= last_id:
+            shot.stable = self.diff[first_id]
+        else:
+            shot.stable = stable / (last_id - first_id)
+        shot.stopTime = self.frameFeat[last_id].time
+        self.features.append([shot.shotId, shot.id, shot.startTime, shot.stopTime, shot.time,
+            shot.diff, shot.shot, shot.stable])
+        return shot
     def run_callbacks(self):
         if self.shotList:
-            shot = self.shotList[-1]
-            shot.stopTime = self.frame.time
-            shot.frame = self.bestFrame
+            shot = self.adjust_shot()
             for c in self.callbacks:
-                c.OnFrame(shot.id, shot.time, shot.frame) # OnShot
+                c.OnFrame(shot.id, shot.time, shot.frame)
+                if hasattr(c, 'OnShot'):
+                    c.OnShot(shot)
             shot.frame = None # useless after calling all callbacks
-    def new_shot(self, id, time, frame):
-        shot = Shot(id, time, frame)
-        shot.shotId = id
+    def new_shot(self):
+        shot = self.frame
+        shot.shotId = self.frame.id
         shot.diff = self.frameFeat[-1].diff
         shot.shot = self.frameFeat[-1].shot
         # previous frame generates the large diff
@@ -133,13 +157,13 @@ class ShotDetector(FrameCallback):
         else:
             self.run_callbacks()
             self.shotList.append(shot)
-            self.bestFrame = frame
-    def replace_keyframe(self, id, time, frame):
+            self.bestFrame = shot.image
+    def replace_keyframe(self):
         shot = self.shotList[-1]
-        shot.id = id
-        shot.time = time
-        shot.image = frame
-        self.bestFrame = frame
+        shot.id = self.frame.id
+        shot.time = self.frame.time
+        shot.image = self.frame.image
+        self.bestFrame = self.frame.image
     def OnFrame(self, id, time, frame):
         self.frame = Shot(id, time, frame) # make these visible
 
@@ -157,7 +181,7 @@ class ShotDetector(FrameCallback):
         if self.bright > bright1:
             self.bright = 0.9 * self.bright + 0.1 * bright1
         
-        self.frameFeat[-1].shot = self.check_shot(id, time, frame)
+        self.frameFeat[-1].shot = self.check_shot()
         self.lastFrame = frame
     def Finalize(self):
         self.run_callbacks()
@@ -166,31 +190,15 @@ class ShotDetector(FrameCallback):
         # copy diff
         for i in range(len(self.frameFeat)):
             self.diff[i] = self.frameFeat[i].diff
-        # shot stableness
-        for i in range(len(self.shotList)):
-            first_id = self.shotList[i].id
-            last_id = len(self.frameFeat)-1
-            if i < len(self.shotList)-1: # not last
-                # shrink
-                last_id = self.shotList[i+1].shotId
-                while first_id < last_id and self.diff[last_id - 1] < self.diff[last_id]:
-                    last_id -= 1
-            stable = 0
-            for id in range(first_id, last_id):
-                stable += self.diff[id]
-            if first_id >= last_id:
-                self.shotList[i].stable = self.diff[first_id]
-            else:
-                self.shotList[i].stable = stable / (last_id - first_id)
-            self.shotList[i].stopTime = self.frameFeat[last_id].time
+
     def pixel_diff(self, f, g):
         return np.sum(cv2.absdiff(f, g)) / f.size
-    def check_shot(self, id, time, frame):
-        n = id
+    def check_shot(self):
+        n = self.frame.id
         # push back diff
         if n == 0:
             self.diff.append(0)
-            self.new_shot(id, time, frame)
+            self.new_shot()
             return 0
         while len(self.diff) < n:
             self.diff.append(0)
@@ -205,12 +213,12 @@ class ShotDetector(FrameCallback):
             lastKeyframe.id = n
         if lastKeyframe.id == n-1:
             if diff < self.diff[n-1] or self.frameFeat[n].bright1 > self.frameFeat[n-1].bright1:
-                self.replace_keyframe(id, time, frame)
+                self.replace_keyframe()
         elif lastKeyframe.id > n-6:
             keyFrameDiff = self.frameFeat[lastKeyframe.id].diff
             peakDiff = self.frameFeat[lastKeyframe.shotId].diff
             if keyFrameDiff * keyFrameDiff > peakDiff * diff:
-                self.replace_keyframe(id, time, frame)
+                self.replace_keyframe()
         
         # pd
         if n > 1 and self.diff[n-1] > self.diff[n-2] and self.diff[n-1] > diff:
@@ -225,7 +233,7 @@ class ShotDetector(FrameCallback):
         if diff > self.diff[n-1] and m > self.frameFeat[n-1].shot:
             self.frameFeat[n-1].shot=1
         if self.frameFeat[n-1].shot > 8 and m < 8:
-            self.new_shot(id, time, frame)
+            self.new_shot()
         return m
 import os
 class FrameDumper(FrameCallback):
